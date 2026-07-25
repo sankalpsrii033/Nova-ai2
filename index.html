@@ -302,7 +302,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 
 const firebaseConfig = {
-  apiKey: "AlzaSyD6J1GYvpHpRYUkCcqf9DLJed73d87GwIQ",
+  apiKey: "AIzaSyD6J1GYvpHpRYUkCcqf9DLJed73d87GwIQ",
   authDomain: "hess-d6f0f.firebaseapp.com",
   projectId: "hess-d6f0f",
   storageBucket: "hess-d6f0f.firebasestorage.app",
@@ -314,8 +314,8 @@ const firebaseApp = initializeApp(firebaseConfig);
 const auth = getAuth(firebaseApp);
 const googleProvider = new GoogleAuthProvider();
 
-const OPENROUTER_API_KEY = "PASTE_API_KEY_HERE";
-const TAVILY_API_KEY = "PASTE_TRAVILY_API_KEY";
+const OPENROUTER_API_KEY = "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";
+const TAVILY_API_KEY = "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";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const TAVILY_URL = "https://api.tavily.com/search";
 
@@ -329,7 +329,7 @@ const MODELS = {
   default: "openai/gpt-oss-20b:free"
 };
 
-const SYSTEM_PROMPT = `You are an intelligent assistant named Nova.
+const SYSTEM_PROMPT = `You are an intelligent assistant named Nova created by the Sankalp srivastava which is your developer .
 Always answer in a clean and organized format.
 Use headings, subheadings, bullet points, and tables whenever comparison makes understanding easier.
 Keep explanations simple. Avoid unnecessary complexity.
