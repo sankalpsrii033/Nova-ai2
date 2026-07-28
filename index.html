@@ -4322,48 +4322,134 @@ async function generateGeminiOnce(modelName, body, signal) {
   return partsOut.map(p => p.text || "").join("");
 }
 
-async function sendWithGeminiFiles(text, files) {
-  if (!GEMINI_API_KEY || GEMINI_API_KEY.includes("PASTE")) {
-    throw new Error("Please set your Gemini API key (GEMINI_API_KEY) in the code");
+/**
+ * Uploaded file / image analysis via Puter.js DeepSeek (Nova Vision UI).
+ * Models: deepseek-v4-pro → deepseek-v4-flash
+ * Images: sent as data URL when Puter supports vision input.
+ * PDFs/DOCX/TXT/etc.: extracted text is sent to the model.
+ */
+async function sendWithNovaVisionFiles(text, files, onDelta) {
+  if (typeof puter === "undefined" || !puter.ai?.chat) {
+    throw new Error("Nova Vision is unavailable right now. Please try again in a few moments.");
   }
 
-  const { mediaFiles, textOnlyDocs } = await prepareGeminiFiles(files || []);
-  const parts = buildGeminiParts(text, mediaFiles, textOnlyDocs);
+  const fileList = files || [];
+  const sections = [];
+  const imageDataUrls = [];
 
-  // Official REST body: system_instruction + contents + generationConfig
-  const body = {
-    system_instruction: {
-      parts: [{
-        text: "You are Nova, an intelligent multimodal assistant. Analyze images, PDFs, documents, code, and data carefully. Use clear markdown with headings, lists, and tables when helpful. For math use LaTeX with $...$ or $$...$$." + getProjectSystemExtra() + getSettingsSystemExtra()
-      }]
-    },
-    contents: [{ role: "user", parts }],
-    generationConfig: {
-      temperature: 0.4,
-      maxOutputTokens: 8192
+  for (const f of fileList) {
+    const name = f.name || "file";
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    const isImg = f.kind === "image" || /^(png|jpe?g|webp|gif)$/i.test(ext);
+
+    if (isImg && f.file) {
+      try {
+        const dataUrl = await fileToBase64DataUrl(f.file);
+        imageDataUrls.push({ name, dataUrl });
+        sections.push(`[Image attached: ${name}]`);
+      } catch (e) {
+        console.warn("[Nova Vision] image encode failed", name, e);
+        sections.push(`[Image: ${name} — could not read]`);
+      }
+    } else {
+      // Prefer pre-extracted text from upload pipeline
+      let content = f.textContent || "";
+      if (!content && f.file) {
+        try {
+          content = await readFileAsText(f.file);
+        } catch (e) {
+          console.warn("[Nova Vision] text extract failed", name, e);
+        }
+      }
+      content = String(content || "").slice(0, 120000);
+      if (content.trim()) {
+        sections.push(`--- File: ${name} ---\n${content}\n--- End of ${name} ---`);
+      } else {
+        sections.push(`--- File: ${name} ---\n(No extractable text. If this is a scanned PDF, OCR may be required.)\n--- End of ${name} ---`);
+      }
     }
-  };
+  }
 
+  const userQ = (text || "").trim()
+    || (imageDataUrls.length && !sections.some(s => s.startsWith("--- File:"))
+      ? "Describe and analyze the attached image(s) in detail. Use clear markdown with headings and lists."
+      : "Provide a complete structured summary of the attached file(s). Preserve tables, equations (LaTeX), and code formatting where possible.");
+
+  const system = "You are Nova Vision, an intelligent document and image analyst. Analyze uploaded files carefully. Use clear markdown with headings, lists, and tables. For math use LaTeX with $...$ or $$...$$. Preserve code blocks with language tags."
+    + (typeof getProjectSystemExtra === "function" ? getProjectSystemExtra() : "")
+    + (typeof getSettingsSystemExtra === "function" ? getSettingsSystemExtra() : "");
+
+  const prompt = `${system}\n\nUser request:\n${userQ}\n\nAttached content:\n${sections.join("\n\n")}`;
+
+  // Puter chat: try multimodal message if images exist and API accepts array content
+  const models = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"];
   let lastErr = null;
-  for (const modelName of GEMINI_MODELS) {
+
+  for (const model of models) {
     try {
-      const full = await streamGeminiModel(modelName, body, abortController?.signal);
-      if (full && full.trim()) return full;
-      // Empty stream → try non-stream once on same model
-      console.warn("[Gemini] empty stream for", modelName, "— trying generateContent");
-      const once = await generateGeminiOnce(modelName, body, abortController?.signal);
-      if (once && once.trim()) return once;
-      lastErr = new Error("Gemini returned an empty response.");
+      let result;
+      // Attempt 1: multimodal-style message with images
+      if (imageDataUrls.length) {
+        try {
+          const contentParts = [
+            { type: "text", text: prompt }
+          ];
+          for (const img of imageDataUrls.slice(0, 4)) {
+            contentParts.push({ type: "image_url", image_url: { url: img.dataUrl } });
+            // alternate shapes some SDKs accept
+            contentParts.push({ type: "image", url: img.dataUrl });
+          }
+          result = await puter.ai.chat(contentParts, { model, stream: true });
+        } catch {
+          // Attempt 2: plain prompt (images already described / text-only models)
+          result = await puter.ai.chat(prompt, { model, stream: true });
+        }
+      } else {
+        result = await puter.ai.chat(prompt, { model, stream: true });
+      }
+
+      // Normalize stream / string / object
+      if (result && typeof result[Symbol.asyncIterator] === "function") {
+        let full = "";
+        for await (const chunk of result) {
+          const t = typeof chunk === "string"
+            ? chunk
+            : (chunk?.text || chunk?.delta || chunk?.message?.content || chunk?.content || "");
+          if (t) {
+            full += t;
+            if (onDelta) onDelta(full);
+          }
+        }
+        if (full.trim()) return full;
+      } else if (typeof result === "string") {
+        if (onDelta) onDelta(result);
+        if (result.trim()) return result;
+      } else {
+        const textOut = result?.message?.content || result?.content || result?.text || "";
+        const s = String(textOut || "");
+        if (onDelta) onDelta(s);
+        if (s.trim()) return s;
+      }
+      lastErr = new Error("Empty analysis response");
     } catch (err) {
       lastErr = err;
-      console.error("[Gemini] model failed:", modelName, err.message, err.geminiBody || "");
-      if (err.name === "AbortError") throw err;
-      if (err.retryModel) continue;
-      // Non-retryable (auth, quota, bad request) — stop
-      throw err;
+      console.warn("[Nova Vision] model failed", model, err);
+      if (err?.name === "AbortError") throw err;
+      // try next model
     }
   }
-  throw lastErr || new Error("All Gemini models failed. Check API key and model access in Google AI Studio.");
+
+  const fail = new Error("Unable to analyze this file right now. Please try again in a few moments.");
+  fail.novaVisionFail = true;
+  throw fail;
+}
+
+// Backward-compatible alias (file analysis path only)
+async function sendWithGeminiFiles(text, files) {
+  return sendWithNovaVisionFiles(text, files, (full) => {
+    const streamBody = typeof $ === "function" ? $("#streamBody") : null;
+    if (streamBody) streamBody.innerHTML = renderMarkdown(full);
+  });
 }
 
 async function generateImage(prompt) {
@@ -4829,13 +4915,9 @@ async function sendMessage(text, isRegen = false) {
   const filesToSend = pendingFiles.slice();
   if ((!text && !filesToSend.length) || isGenerating) return;
 
-  // Text-only path still needs OpenRouter; file path uses Gemini
+  // Text-only path still needs OpenRouter; file path uses Puter DeepSeek (Nova Vision)
   if (!filesToSend.length && (!OPENROUTER_API_KEY || OPENROUTER_API_KEY.includes("PASTE"))) {
     showToast("Please configure Nova HyperOS API access in the code", "error");
-    return;
-  }
-  if (filesToSend.length && (!GEMINI_API_KEY || GEMINI_API_KEY.includes("PASTE"))) {
-    showToast("Please set your Gemini API key (GEMINI_API_KEY) in the code", "error");
     return;
   }
 
@@ -4911,7 +4993,7 @@ async function sendMessage(text, isRegen = false) {
   const memoryOn = !!(userSettings?.memoryEnabled && userSettings?.customMemories?.length);
   activeProcMeta.memoryUsed = memoryOn;
 
-  // Multimodal path via Google Gemini
+  // Multimodal path via Nova Vision (Puter DeepSeek)
   if (filesToSend.length) {
     abortController = new AbortController();
     try {
@@ -4922,26 +5004,28 @@ async function sendMessage(text, isRegen = false) {
       activeProcMeta.filesAnalyzed = docs;
       if (imgs.length) {
         setProcStep("Analyzing Images…", "active");
-        activeProcMeta.tools.push("Vision");
+        activeProcMeta.tools.push("Nova Vision");
       }
-      if (docs.length) activeProcMeta.tools.push("File analysis");
+      if (docs.length) activeProcMeta.tools.push("Nova Vision");
       if (memoryOn) setProcStep("Checking Conversation Memory…", "done");
       setProcStep("Selecting AI Model…", "active");
-      activeProcMeta.model = GEMINI_MODEL;
-      activeProcMeta.tools.push("Gemini");
-      $("#chatSub").textContent = "Nova Vision…";
+      activeProcMeta.model = "deepseek/deepseek-v4-pro";
+      activeProcMeta.tools.push("Nova Vision");
+      $("#chatSub").textContent = "Analyzing with Nova Vision…";
       setProcStep("Generating Response…", "active");
       const streamSlot = document.createElement("div");
       streamSlot.className = "msg-body";
       streamSlot.id = "streamBody";
       $("#procTimeline")?.after(streamSlot);
-      const full = await sendWithGeminiFiles(text, filesToSend);
+      const full = await sendWithNovaVisionFiles(text, filesToSend, (partial) => {
+        streamSlot.innerHTML = renderMarkdown(partial);
+      });
       setProcStep("Rendering Markdown…", "active");
       if (/\$|\\\[|\\\(/.test(full)) setProcStep("Rendering LaTeX…", "done");
       setProcStep("Finalizing Response…", "active");
       finishProcSteps();
-      const proc = finalizeProcMeta({ success: true, model: GEMINI_MODEL });
-      let gMsg = { role: "assistant", content: full, ts: Date.now(), model: GEMINI_MODEL, proc };
+      const proc = finalizeProcMeta({ success: true, model: "Nova Vision" });
+      let gMsg = { role: "assistant", content: full, ts: Date.now(), model: "Nova Vision", proc };
       gMsg = await maybeAttachUnsplash(text, gMsg);
       conv.messages.push(gMsg);
       conv.updated = Date.now();
@@ -4954,7 +5038,13 @@ async function sendMessage(text, isRegen = false) {
       const thinking = $("#thinkingMsg");
       if (thinking) thinking.remove();
       if (err.name === "AbortError") showToast("Generation stopped", "info");
-      else showToast(err.message || "File analysis failed", "error");
+      else if (err.novaVisionFail) {
+        showModal(`
+          <h3>Nova Vision</h3>
+          <p style="color:var(--text-muted);line-height:1.5;margin:12px 0 18px">Unable to analyze this file right now. Please try again in a few moments.</p>
+          <div class="modal-btns"><button class="confirm" onclick="hideModal()">OK</button></div>
+        `, true);
+      } else showToast(err.message || "File analysis failed", "error");
       $("#chatSub").textContent = "Error";
     } finally {
       isGenerating = false;
